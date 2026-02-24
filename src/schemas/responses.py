@@ -51,3 +51,10 @@ class DocumentListResponse(BaseModel):
     documents: List[DocumentResponse]
     total: int
     bucket_name: str
+
+class OCRResultResponse(BaseModel):
+    """OCR result response model."""
+    status: bool
+    file_id: str
+    total_pages: int
+    pages: list[dict]

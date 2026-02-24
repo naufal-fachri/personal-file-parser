@@ -6,7 +6,7 @@ from typing import AsyncGenerator
 from io import BytesIO
 
 from loguru import logger
-from fastapi import APIRouter, UploadFile, HTTPException, Depends, Form
+from fastapi import APIRouter, UploadFile, HTTPException, Depends, Form, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -15,6 +15,8 @@ from src.core.validator import FileValidator
 from src.services.extract import FileExtractionService
 from src.services.docs import upload_file_to_minio
 from src.config import settings
+from src.schemas.responses import OCRResultResponse
+from src.tools.utils import get_progress, get_result
 
 
 router = APIRouter()
@@ -407,4 +409,45 @@ async def extract_file(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+# ──────────────────────────────────────────────
+# GET /ocr/result/{file_id}
+# ──────────────────────────────────────────────
+@router.get(
+    "/doc/ocr_result/{file_id}",
+    response_model=OCRResultResponse,
+    summary="Get final OCR result for a file",
+)
+async def ocr_result(file_id: str):
+    """
+    Returns the final combined OCR result from Redis.
+    Only call this after progress shows state=SUCCESS.
+    """
+    pages = get_result(file_id)
+
+    if pages is None:
+        # Result not in Redis yet — check why
+        progress = get_progress(file_id)
+        if progress["state"] in ("PENDING", "PROCESSING", "COMBINING"):
+            raise HTTPException(
+                status_code=status.HTTP_202_ACCEPTED,
+                detail=f"Task still in progress: {progress['message']}",
+            )
+        elif progress["state"] == "FAILURE":
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"OCR failed: {progress['error']}",
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Result not found. It may have expired or never completed.",
+            )
+
+    return OCRResultResponse(
+        status=True,
+        file_id=file_id,
+        total_pages=len(pages),
+        pages=pages,
     )

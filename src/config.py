@@ -43,5 +43,10 @@ class Settings(BaseSettings):
     MINIO_SECRET_KEY: str
     CA_CERTS_PATH: str
 
+    # --- Redis Configuration
+    REDIS_HOST: str
+    REDIS_PORT: int
+    REDIS_PASSWORD: str
+
 
 settings = Settings()
