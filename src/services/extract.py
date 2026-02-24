@@ -120,8 +120,6 @@ class FileExtractionService:
                     "stage": "fetching",
                     "percent": 100,
                     "message": "Fetching OCR results...",
-                    "completed_pages": 0,
-                    "total_pages": 0,
                 })
 
             ocr_result = await self._fetch_ocr_result(file_id=file_id)

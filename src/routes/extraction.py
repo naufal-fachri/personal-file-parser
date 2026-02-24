@@ -133,8 +133,8 @@ async def extract_file(
                 "status": "processing",
                 "message": progress_data.get("message", ""),
                 "percent": progress_data.get("percent", 0),
-                "completed_pages": progress_data.get("completed_pages", 0),
-                "total_pages": progress_data.get("total_pages", 0),
+                "completed_pages": progress_data.get("completed_pages", None),
+                "total_pages": progress_data.get("total_pages", None),
             })
 
         def sse(data: dict) -> str:
