@@ -3,30 +3,17 @@ from minio import Minio
 from loguru import logger
 from fastapi import UploadFile
 from datetime import datetime
-from urllib.parse import quote, unquote  # Add this import
+from urllib.parse import quote  # Add this import
 from src.config import settings
 from src.schemas.exceptions import (
     MinioConnectionError,
-    DatabaseError,
-    DocumentNotFoundError,
 )
 from minio.error import S3Error
 
 http_client = urllib3.PoolManager(
     cert_reqs='CERT_REQUIRED',
-    ca_certs='/home/naufal/minio/certs/public.crt'
+    ca_certs=settings.CA_CERTS_PATH
 )
-# Create a synchronous database engine by replacing asyncpg with psycopg2
-def get_sync_database_url():
-    """Convert async database URL to sync version for psycopg2."""
-    db_url = settings.DATABASE_URL
-    if "postgresql+asyncpg://" in db_url:
-        return db_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
-    elif "postgresql://" in db_url and "asyncpg" not in db_url:
-        # If it's a plain postgresql URL, make it explicit for psycopg2
-        return db_url.replace("postgresql://", "postgresql+psycopg2://")
-    return db_url
-
 
 def upload_file_to_minio(file: UploadFile, file_id: str) -> str:
     """

@@ -24,7 +24,6 @@ _extraction_service: FileExtractionService | None = None
 
 class ExtractionRequest(BaseModel):
     user_id: str
-    conversation_id: str
 
 
 def _upload_to_minio_sync(
@@ -33,13 +32,7 @@ def _upload_to_minio_sync(
     content_type: str,
     file_id: str,
 ) -> str:
-    """
-    Synchronous MinIO upload wrapper that matches the actual
-    upload_file_to_minio(file, file_id) signature.
-    """
-
     class MinioUploadFile:
-        """Mimics UploadFile interface for MinIO upload."""
         def __init__(self, content: bytes, fname: str, ctype: str):
             self.file = BytesIO(content)
             self.filename = fname
@@ -51,33 +44,24 @@ def _upload_to_minio_sync(
 
 
 async def async_upload_to_minio(
-    file_content: bytes,
-    filename: str,
-    content_type: str,
-    file_id: str,
+    file_content: bytes, filename: str,
+    content_type: str, file_id: str,
 ) -> str:
-    """Async wrapper for synchronous MinIO upload."""
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor() as executor:
         return await loop.run_in_executor(
-            executor,
-            _upload_to_minio_sync,
-            file_content,
-            filename,
-            content_type,
-            file_id,
+            executor, _upload_to_minio_sync,
+            file_content, filename, content_type, file_id,
         )
 
 
 def get_extraction_service() -> FileExtractionService:
-    """Dependency to get the extraction service."""
     if not _extraction_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
     return _extraction_service
 
 
 def set_extraction_service(service: FileExtractionService) -> None:
-    """Set the extraction service instance."""
     global _extraction_service
     _extraction_service = service
 
@@ -87,13 +71,12 @@ def set_extraction_service(service: FileExtractionService) -> None:
     response_class=StreamingResponse,
     responses={
         200: {
-            "description": "Server-Sent Events (SSE) stream with real-time progress updates",
+            "description": "SSE stream with real-time progress updates",
             "content": {
                 "text/event-stream": {
                     "schema": {
                         "type": "string",
-                        "description": "Stream of SSE events in JSON format",
-                        "example": 'data: {"status": "started", "message": "Reading file..."}\n\n',
+                        "example": 'data: {"stage": "extraction", "status": "processing", ...}\n\n',
                     }
                 }
             },
@@ -111,51 +94,59 @@ def set_extraction_service(service: FileExtractionService) -> None:
 async def extract_file(
     file: UploadFile,
     user_id: str = Form(...),
-    conversation_id: str = Form(...),
     extraction_service: FileExtractionService = Depends(get_extraction_service),
 ):
     """
     Extract documents or upload images/presentations with progress updates via SSE.
 
-    Flow for PDFs:
-        1. Submit to OCR service → real-time extraction progress
-        2. Chunk extracted text
-        3. Upsert chunks to vector store
-        4. Upload original file to MinIO
-        5. Return final result with file metadata
+    SSE event format:
+        {
+            "stage": "reading" | "extraction" | "chunking" | "upserting" | "uploading" | "completed" | "failed",
+            "status": "started" | "processing" | "completed" | "failed" | "error",
+            "message": "human-readable message",
 
-    Flow for DOCX:
-        Same as above but extraction happens locally.
+            // Only for "extraction" stage (OCR):
+            "percent": 0-100,
+            "completed_pages": int,
+            "total_pages": int,
 
-    Flow for images/presentations:
-        Direct upload to MinIO storage.
+            // Only for "completed" / "failed" stages:
+            "file_metadata": { ... },
+            "success": bool,
+            "error": str | null,
+        }
     """
 
     async def progress_generator() -> AsyncGenerator[str, None]:
         content = None
         file_content_for_minio = None
         file_name = file.filename or "unknown"
-        file_id = str(uuid5(NAMESPACE_DNS, f"{file_name}_{user_id}_{conversation_id}"))
+        file_id = str(uuid5(NAMESPACE_DNS, f"{file_name}_{user_id}"))
         extraction_task = None
 
-        # Queue for receiving progress updates from OCR service
         progress_queue: asyncio.Queue[dict] = asyncio.Queue()
 
-        def on_ocr_progress(percent: float, message: str):
-            """Callback that pushes OCR progress into the SSE queue."""
+        def on_ocr_progress(progress_data: dict):
+            """Callback from OCR service — pushes structured progress into SSE queue."""
             progress_queue.put_nowait({
+                "stage": progress_data.get("stage", "extraction"),
                 "status": "processing",
-                "message": message,
-                "progress": round(percent, 1),
+                "message": progress_data.get("message", ""),
+                "percent": progress_data.get("percent", 0),
+                "completed_pages": progress_data.get("completed_pages", 0),
+                "total_pages": progress_data.get("total_pages", 0),
             })
 
         def sse(data: dict) -> str:
-            """Helper to format SSE data."""
             return f"data: {json.dumps(data)}\n\n"
 
         try:
-            # ── Step 0: Read & validate file ──
-            yield sse({"status": "started", "message": "Reading file..."})
+            # ── Read & validate ──
+            yield sse({
+                "stage": "reading",
+                "status": "started",
+                "message": "Reading file...",
+            })
 
             try:
                 content = await asyncio.wait_for(file.read(), timeout=60.0)
@@ -175,9 +166,9 @@ async def extract_file(
                 file_type = "image" if is_image else "presentation"
 
                 yield sse({
+                    "stage": "uploading",
                     "status": "processing",
                     "message": f"Uploading {file_type} to storage...",
-                    "progress": 50.0,
                 })
 
                 try:
@@ -200,9 +191,9 @@ async def extract_file(
                     logger.info(f"{file_type.capitalize()} uploaded to MinIO: {file_url}")
 
                     yield sse({
+                        "stage": "completed",
                         "status": "completed",
                         "message": f"{file_type.capitalize()} uploaded successfully!",
-                        "progress": 100.0,
                         "file_metadata": {
                             "file_name": file_name,
                             "file_id": file_id,
@@ -216,9 +207,9 @@ async def extract_file(
                 except Exception as minio_error:
                     logger.error(f"Failed to upload {file_type} to MinIO: {minio_error}")
                     yield sse({
+                        "stage": "failed",
                         "status": "failed",
                         "message": f"Failed to upload {file_type}",
-                        "progress": 0.0,
                         "file_metadata": {
                             "file_name": file_name,
                             "file_id": file_id,
@@ -232,12 +223,6 @@ async def extract_file(
             # PATH B: Document processing (PDF / DOCX)
             # ────────────────────────────────────────────
             else:
-                yield sse({
-                    "status": "processing",
-                    "message": "Starting content extraction...",
-                    "progress": 5.0,
-                })
-
                 try:
                     async with asyncio.timeout(600):
                         async with extraction_service.semaphore:
@@ -253,26 +238,33 @@ async def extract_file(
                                     )
                                 )
 
-                                # Stream progress until extraction completes
+                                # Stream OCR progress until done
                                 while not extraction_task.done():
                                     try:
                                         progress = await asyncio.wait_for(
-                                            progress_queue.get(),
-                                            timeout=3.0,
+                                            progress_queue.get(), timeout=3.0,
                                         )
                                         yield sse(progress)
                                     except asyncio.TimeoutError:
                                         continue
 
-                                # Drain remaining progress messages
+                                # Drain remaining
                                 while not progress_queue.empty():
-                                    progress = progress_queue.get_nowait()
-                                    yield sse(progress)
+                                    yield sse(progress_queue.get_nowait())
 
                                 extraction_result = extraction_task.result()
 
                             else:
                                 # ── DOCX: Local extraction ──
+                                yield sse({
+                                    "stage": "extraction",
+                                    "status": "processing",
+                                    "message": "Extracting Word document...",
+                                    "percent": 0,
+                                    "completed_pages": 0,
+                                    "total_pages": 0,
+                                })
+
                                 extraction_result = await asyncio.to_thread(
                                     extraction_service.extract_word,
                                     content,
@@ -286,15 +278,15 @@ async def extract_file(
                         "Extraction timeout - file too large or complex"
                     )
 
-                # Free raw content from memory
+                # Free raw content
                 del content
                 content = None
 
                 if extraction_result.get("status") != "success":
                     yield sse({
+                        "stage": "failed",
                         "status": "failed",
                         "message": "Extraction failed or no content found",
-                        "progress": 0.0,
                         "file_metadata": {
                             "file_name": file_name,
                             "file_id": file_id,
@@ -309,25 +301,24 @@ async def extract_file(
 
                 # ── Chunking ──
                 yield sse({
+                    "stage": "chunking",
                     "status": "processing",
                     "message": "Chunking document...",
-                    "progress": 70.0,
                 })
 
                 chunked_documents, ids = await extraction_service.chunk_file(
                     parsed_file_result=extraction_result,
                     user_id=user_id,
-                    conversation_id=conversation_id,
                     chunker=extraction_service.chunker,
                 )
 
                 del extraction_result
 
-                # ── Upserting to vector store ──
+                # ── Upserting ──
                 yield sse({
+                    "stage": "upserting",
                     "status": "processing",
                     "message": f"Upserting {len(chunked_documents)} chunks to vector store...",
-                    "progress": 80.0,
                 })
 
                 upsert_status = await extraction_service.upsert_chunks_to_vector_store(
@@ -339,14 +330,14 @@ async def extract_file(
 
                 del chunked_documents, ids
 
-                # ── Upload original file to MinIO ──
+                # ── Upload to MinIO ──
                 file_url = None
                 if upsert_status:
                     try:
                         yield sse({
+                            "stage": "uploading",
                             "status": "processing",
                             "message": "Uploading file to storage...",
-                            "progress": 90.0,
                         })
 
                         file_url = await async_upload_to_minio(
@@ -368,9 +359,9 @@ async def extract_file(
 
                 # ── Final result ──
                 yield sse({
+                    "stage": "completed" if upsert_status else "failed",
                     "status": "completed" if upsert_status else "failed",
                     "message": "Processing completed!" if upsert_status else "Processing failed",
-                    "progress": 100.0 if upsert_status else 0.0,
                     "file_metadata": {
                         "file_name": file_name,
                         "file_id": file_id,
@@ -390,9 +381,9 @@ async def extract_file(
         except Exception as e:
             logger.error(f"Error processing file {file_name}: {e}", exc_info=True)
             yield sse({
+                "stage": "failed",
                 "status": "error",
                 "message": str(e),
-                "progress": 0.0,
                 "file_metadata": {"file_name": file_name, "file_id": file_id},
                 "success": False,
                 "error": str(e),

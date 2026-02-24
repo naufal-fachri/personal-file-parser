@@ -10,7 +10,7 @@ class Settings(BaseSettings):
 
     # --- Google Gemini Configuration ---
     GOOGLE_API_KEY: str
-    GOOGLE_EMBEDDING_MODEL: str = "google-embedding-1"
+    GOOGLE_EMBEDDING_MODEL: str = "gemini-embedding-001"
     GOOGLE_EMBEDDING_DIMENSION: int = 768
 
     # --- Sparse Embedding Configuration ---
@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     VECTOR_STORE_BATCH_SIZE: int = 64
 
     # --- OCR Service Configuration ---
-    OCR_SERVICE_URL: str = "http://localhost:8001"
+    OCR_SERVICE_URL: str = "http://host.docker.internal:8001"
     OCR_POLL_INTERVAL: float = 2.0
     OCR_TIMEOUT: float = 600.0
 
@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     MINIO_ENDPOINT: str
     MINIO_ACCESS_KEY: str
     MINIO_SECRET_KEY: str
+    CA_CERTS_PATH: str
 
 
 settings = Settings()
