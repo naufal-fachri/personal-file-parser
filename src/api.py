@@ -32,12 +32,10 @@ async def lifespan(app: FastAPI):
         logger.info("Setting up process executor and extraction service...")
 
         # Create dependencies
-        semaphore = create_semaphore()
         vector_store, qdrant_client = create_vector_store()
         chunker = create_text_chunker()
 
         extraction_service = FileExtractionService(
-            semaphore=semaphore,
             chunker=chunker,
             vector_store=vector_store,
             ocr_service_url=settings.OCR_SERVICE_URL,

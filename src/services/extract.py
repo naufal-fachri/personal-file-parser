@@ -1,10 +1,11 @@
 import asyncio
+import httpx
 from io import BytesIO
 from typing import Any, Optional, Callable
-from uuid import uuid4, uuid5, NAMESPACE_DNS
-
+from uuid import uuid5, NAMESPACE_DNS
 from loguru import logger
-import httpx
+
+from src.config import settings
 
 # Import extractors
 try:
@@ -34,14 +35,12 @@ class FileExtractionService:
 
     def __init__(
         self,
-        semaphore: asyncio.Semaphore,
         chunker: RecursiveCharacterTextSplitter,
         vector_store: QdrantVectorStore,
-        ocr_service_url: str = "http://localhost:8001",
+        ocr_service_url: str = settings.OCR_SERVICE_URL,
         ocr_poll_interval: float = 2.0,
         ocr_timeout: float = 600.0,
     ):
-        self.semaphore = semaphore
         self.chunker = chunker
         self.vector_store = vector_store
         self.ocr_service_url = ocr_service_url.rstrip("/")
@@ -60,6 +59,7 @@ class FileExtractionService:
     async def extract_pdf(
         self,
         file: bytes,
+        file_id: str,
         filename: str,
         batch_size: int = 4,
         on_progress: Optional[Callable[[dict], None]] = None,
@@ -69,6 +69,7 @@ class FileExtractionService:
 
         Args:
             file: Raw PDF bytes
+            file_id: UUID
             filename: Original filename
             batch_size: Pages per OCR batch
             on_progress: Callback receiving a dict:
@@ -80,9 +81,10 @@ class FileExtractionService:
                     "total_pages": int,
                 }
         """
-        file_id = uuid4().hex
-
         try:
+            # ── Step 0: Reset stale state from any previous run ──
+            await self._reset_ocr_state(file_id)
+
             # ── Step 1: Submit ──
             if on_progress:
                 on_progress({
@@ -141,9 +143,27 @@ class FileExtractionService:
         finally:
             await self._cleanup_ocr(file_id=file_id)
 
+    async def _reset_ocr_state(self, file_id: str):
+        """Reset any stale Redis state from a previous run with the same file_id."""
+        try:
+            response = await self._http_client.post(
+                f"{self.ocr_service_url}/ocr/reset/{file_id}"
+            )
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("cleared"):
+                    logger.info(f"🧹 Reset stale OCR state for file_id={file_id}: {result['cleared']}")
+            else:
+                logger.warning(f"OCR reset returned {response.status_code} for file_id={file_id}")
+        except httpx.RequestError as e:
+            logger.warning(f"Failed to reset OCR state for file_id={file_id}: {e}")
+
     async def _submit_to_ocr(
-        self, file: bytes, filename: str,
-        file_id: str, batch_size: int,
+        self,
+        file: bytes,
+        filename: str,
+        file_id: str,
+        batch_size: int,
     ) -> Optional[dict]:
         """Submit PDF to OCR service."""
         try:
@@ -161,7 +181,8 @@ class FileExtractionService:
             return None
 
     async def _poll_ocr_progress(
-        self, file_id: str,
+        self,
+        file_id: str,
         on_progress: Optional[Callable[[dict], None]] = None,
     ) -> bool:
         """Poll OCR service until completion or timeout."""
@@ -239,16 +260,30 @@ class FileExtractionService:
         except httpx.RequestError:
             logger.warning(f"Failed to cleanup OCR files for file_id={file_id}")
 
-    # ──────────────────────────────────────────────
-    # Word Document Extraction (local)
-    # ──────────────────────────────────────────────
+    def extract_word(
+        self,
+        file: bytes,
+        file_id: str,
+        filename: str,
+        on_progress: Optional[Callable[[dict], None]] = None,
+    ) -> dict[str, Any]:
+        """
+        Extract content from Word document.
 
-    def extract_word(self, file: bytes, filename: str) -> dict[str, Any]:
-        """Extract content from Word document."""
+        Args:
+            file: Raw file bytes
+            filename: Original filename
+            on_progress: Optional callback for progress updates (same format as PDF)
+        """
         buffer = None
         try:
             buffer = BytesIO(file)
-            result = self._word_extractor.extract_file(file=buffer, filename=filename)
+            result = self._word_extractor.extract_file(
+                file=buffer,
+                file_id=file_id,
+                filename=filename,
+                on_progress=on_progress,
+            )
             if result.get("status") == "success":
                 logger.info("Word document extraction successful")
                 return result
@@ -261,12 +296,10 @@ class FileExtractionService:
             if buffer:
                 buffer.close()
 
-    # ──────────────────────────────────────────────
-    # Chunking & Vector Store
-    # ──────────────────────────────────────────────
-
     async def chunk_file(
-        self, parsed_file_result: dict, user_id: str,
+        self,
+        parsed_file_result: dict,
+        user_id: str,
         chunker: RecursiveCharacterTextSplitter,
     ) -> tuple[list[Document], list[str]]:
         if not parsed_file_result:
@@ -318,8 +351,11 @@ class FileExtractionService:
             documents.clear()
 
     async def upsert_chunks_to_vector_store(
-        self, documents: list[Document], ids: list[str],
-        batch_size: int, vector_store: QdrantVectorStore,
+        self,
+        documents: list[Document],
+        ids: list[str],
+        batch_size: int,
+        vector_store: QdrantVectorStore,
     ) -> bool:
         try:
             for i in range(0, len(documents), batch_size):

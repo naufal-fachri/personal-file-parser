@@ -65,3 +65,24 @@ def get_result(file_id: str) -> list[dict[str, Any]] | None:
     if not data:
         return None
     return json.loads(data)
+
+def _save_result(
+    file_id: str,
+    results: list[dict[str, Any]],
+):
+    """Persist OCR results to Redis with a short TTL.
+
+    Serializes the result list as JSON and stores it under a key derived
+    from ``file_id``. The key expires after 300 seconds (5 minutes),
+    giving the caller enough time to retrieve the results.
+
+    Args:
+        file_id: Unique identifier for the processed file.
+        results: List of per-page OCR result dicts to store.
+    """
+    key = f"ocr_results:{file_id}"
+    REDIS_CLIENT.set(
+        key,
+        json.dumps(results),
+        ex=300,
+    )

@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid5, NAMESPACE_DNS
 from typing import AsyncGenerator
 from io import BytesIO
-
 from loguru import logger
 from fastapi import APIRouter, UploadFile, HTTPException, Depends, Form, status
 from fastapi.responses import StreamingResponse
@@ -103,11 +102,11 @@ async def extract_file(
 
     SSE event format:
         {
-            "stage": "reading" | "extraction" | "chunking" | "upserting" | "uploading" | "completed" | "failed",
+            "stage": "reading" | "extraction" | "fetching" | "chunking" | "upserting" | "uploading" | "completed" | "failed",
             "status": "started" | "processing" | "completed" | "failed" | "error",
             "message": "human-readable message",
 
-            // Only for "extraction" stage (OCR):
+            // Only for "extraction" stage (OCR / Word):
             "percent": 0-100,
             "completed_pages": int,
             "total_pages": int,
@@ -128,8 +127,8 @@ async def extract_file(
 
         progress_queue: asyncio.Queue[dict] = asyncio.Queue()
 
-        def on_ocr_progress(progress_data: dict):
-            """Callback from OCR service — pushes structured progress into SSE queue."""
+        def on_progress(progress_data: dict):
+            """Callback from extraction service — pushes structured progress into SSE queue."""
             progress_queue.put_nowait({
                 "stage": progress_data.get("stage", "extraction"),
                 "status": "processing",
@@ -221,57 +220,65 @@ async def extract_file(
                         "error": str(minio_error),
                     })
 
-            # ────────────────────────────────────────────
-            # PATH B: Document processing (PDF / DOCX)
-            # ────────────────────────────────────────────
             else:
                 try:
                     async with asyncio.timeout(600):
-                        async with extraction_service.semaphore:
 
-                            if file.filename.lower().endswith(".pdf"):
-                                # ── PDF: OCR service with real-time progress ──
-                                extraction_task = asyncio.create_task(
-                                    extraction_service.extract_pdf(
-                                        file=content,
-                                        filename=file.filename,
-                                        batch_size=20,
-                                        on_progress=on_ocr_progress,
-                                    )
+                        if file.filename.lower().endswith(".pdf"):
+                            # ── PDF: OCR service with real-time progress ──
+                            extraction_task = asyncio.create_task(
+                                extraction_service.extract_pdf(
+                                    file=content,
+                                    filename=file.filename,
+                                    file_id=file_id,
+                                    batch_size=8,
+                                    on_progress=on_progress,
                                 )
+                            )
 
-                                # Stream OCR progress until done
-                                while not extraction_task.done():
-                                    try:
-                                        progress = await asyncio.wait_for(
-                                            progress_queue.get(), timeout=3.0,
-                                        )
-                                        yield sse(progress)
-                                    except asyncio.TimeoutError:
-                                        continue
+                            # Stream progress until done
+                            while not extraction_task.done():
+                                try:
+                                    progress = await asyncio.wait_for(
+                                        progress_queue.get(), timeout=3.0,
+                                    )
+                                    yield sse(progress)
+                                except asyncio.TimeoutError:
+                                    continue
 
-                                # Drain remaining
-                                while not progress_queue.empty():
-                                    yield sse(progress_queue.get_nowait())
+                            # Drain remaining
+                            while not progress_queue.empty():
+                                yield sse(progress_queue.get_nowait())
 
-                                extraction_result = extraction_task.result()
+                            extraction_result = extraction_task.result()
 
-                            else:
-                                # ── DOCX: Local extraction ──
-                                yield sse({
-                                    "stage": "extraction",
-                                    "status": "processing",
-                                    "message": "Extracting Word document...",
-                                    "percent": 0,
-                                    "completed_pages": 0,
-                                    "total_pages": 0,
-                                })
-
-                                extraction_result = await asyncio.to_thread(
+                        else:
+                            # ── DOCX: Local extraction with real-time progress ──
+                            extraction_task = asyncio.create_task(
+                                asyncio.to_thread(
                                     extraction_service.extract_word,
                                     content,
+                                    file_id,
                                     file.filename,
+                                    on_progress,
                                 )
+                            )
+
+                            # Stream progress until done (same pattern as PDF)
+                            while not extraction_task.done():
+                                try:
+                                    progress = await asyncio.wait_for(
+                                        progress_queue.get(), timeout=3.0,
+                                    )
+                                    yield sse(progress)
+                                except asyncio.TimeoutError:
+                                    continue
+
+                            # Drain remaining
+                            while not progress_queue.empty():
+                                yield sse(progress_queue.get_nowait())
+
+                            extraction_result = extraction_task.result()
 
                 except asyncio.TimeoutError:
                     if extraction_task and not extraction_task.done():
@@ -301,7 +308,7 @@ async def extract_file(
 
                 logger.info(f"Extraction successful for file: {file.filename}")
 
-                # ── Chunking ──
+                # ── Step 2: Chunking ──
                 yield sse({
                     "stage": "chunking",
                     "status": "processing",
@@ -316,7 +323,7 @@ async def extract_file(
 
                 del extraction_result
 
-                # ── Upserting ──
+                # ── Step 3: Upserting ──
                 yield sse({
                     "stage": "upserting",
                     "status": "processing",
@@ -332,7 +339,7 @@ async def extract_file(
 
                 del chunked_documents, ids
 
-                # ── Upload to MinIO ──
+                # ── Step 4: Upload to MinIO ──
                 file_url = None
                 if upsert_status:
                     try:
@@ -411,9 +418,6 @@ async def extract_file(
         },
     )
 
-# ──────────────────────────────────────────────
-# GET /ocr/result/{file_id}
-# ──────────────────────────────────────────────
 @router.get(
     "/doc/ocr_result/{file_id}",
     response_model=OCRResultResponse,
@@ -427,7 +431,6 @@ async def ocr_result(file_id: str):
     pages = get_result(file_id)
 
     if pages is None:
-        # Result not in Redis yet — check why
         progress = get_progress(file_id)
         if progress["state"] in ("PENDING", "PROCESSING", "COMBINING"):
             raise HTTPException(
